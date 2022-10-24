@@ -46,7 +46,7 @@ data "aws_iam_policy_document" "bucket_policy" {
 
     principals {
       type        = "AWS"
-      identifiers = module.cloudfront.cloudfront_origin_access_identity_iam_arns
+      identifiers = [aws_cloudfront_origin_access_identity.my_origin_access_identity.iam_arn]
     }
   }
 
@@ -169,7 +169,8 @@ data "aws_iam_policy_document" "codebuild_policy" {
       "s3:GetObjectVersion",
       "s3:GetBucketVersioning",
       "s3:ListBucket",
-      "s3:DeleteObject"
+      "s3:DeleteObject",
+      "cloudfront:CreateInvalidation"
     ]
 
     resources = ["${module.s3_bucket.s3_bucket_arn}",
@@ -181,7 +182,8 @@ data "aws_iam_policy_document" "codebuild_policy" {
     effect = "Allow"
 
     actions = [
-      "codebuild:*"
+      "codebuild:*",
+      "cloudfront:CreateInvalidation"
     ]
 
     resources = ["${aws_codebuild_project.build_project.id}"]
@@ -194,7 +196,8 @@ data "aws_iam_policy_document" "codebuild_policy" {
     actions = [
       "logs:CreateLogGroup",
       "logs:CreateLogStream",
-      "logs:PutLogEvents"
+      "logs:PutLogEvents",
+      "cloudfront:CreateInvalidation"
     ]
 
     resources = ["*"]
@@ -214,6 +217,10 @@ resource "aws_iam_role_policy" "attach_codebuild_policy" {
 }
 
 
+data "local_file" "buildspec_local" {
+  filename = "./buildspec.yml"
+}
+
 # Create CodeBuild project
 resource "aws_codebuild_project" "build_project" {
   name          = "${var.aws_codebuild_project_name}-website-build"
@@ -230,11 +237,16 @@ resource "aws_codebuild_project" "build_project" {
     image                       = "aws/codebuild/standard:5.0"
     type                        = "LINUX_CONTAINER"
     image_pull_credentials_type = "CODEBUILD"
+
+    environment_variable {
+      name  = "DISTRIBUITION_ID"
+      value = aws_cloudfront_distribution.s3_distribution.id
+    }
   }
 
   source {
     type      = "CODEPIPELINE"
-    buildspec = "buildspec.yml"
+    buildspec = data.local_file.buildspec_local.content
   }
 
   tags = {
@@ -283,24 +295,6 @@ resource "aws_codepipeline" "codepipeline" {
     }
   }
 
-  #stage {
-  #  name = "Build"
-  #
-  #  action {
-  #    name             = "Build"
-  #    category         = "Build"
-  #    owner            = "AWS"
-  #    provider         = "CodeBuild"
-  #    input_artifacts  = ["SourceArtifact"]
-  #    output_artifacts = ["OutputArtifact"]
-  #    version          = "1"
-  #
-  #
-  #    configuration = {
-  #      ProjectName = aws_codebuild_project.build_project.name
-  #    }
-  #  }
-  #}
 
   stage {
     name = "Deploy"
@@ -320,57 +314,87 @@ resource "aws_codepipeline" "codepipeline" {
     }
   }
 
+  stage {
+    name = "Invalidate"
+
+    action {
+      name             = "Build"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["SourceArtifact"]
+      output_artifacts = ["OutputArtifact"]
+      version          = "1"
+
+
+      configuration = {
+        ProjectName = aws_codebuild_project.build_project.name
+      }
+    }
+  }
+
   tags = {
     ManagedBy = "Terraform"
   }
 
 }
 
+locals {
+  s3_origin_id = "s3_one"
+}
 
-// Cloudfront module
-module "cloudfront" {
-  source = "terraform-aws-modules/cloudfront/aws"
+resource "aws_cloudfront_origin_access_identity" "my_origin_access_identity" {
+  comment = "MyCloudFront"
+}
 
+resource "aws_cloudfront_distribution" "s3_distribution" {
+  origin {
+    domain_name = "${var.bucket_name}.s3.amazonaws.com"
+    origin_id   = local.s3_origin_id
 
-  comment             = "My CloudFront"
-  enabled             = true
-  is_ipv6_enabled     = true
-  price_class         = "PriceClass_All"
-  retain_on_delete    = false
-  wait_for_deployment = false
-  default_root_object = "index.html"
-
-  create_origin_access_identity = true
-
-  origin_access_identities = {
-    s3_bucket_one = "My CloudFront can access"
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.my_origin_access_identity.cloudfront_access_identity_path
+    }
   }
 
-  origin = {
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "My CloudFront"
+  default_root_object = "index.html"
 
-    s3_one = {
-      domain_name = "${var.bucket_name}.s3.amazonaws.com"
-      s3_origin_config = {
-        origin_access_identity = "s3_bucket_one"
-        http_port              = 80
-        https_port             = 443
-        origin_protocol_policy = "match-viewer"
-        origin_ssl_protocols   = ["TLSv1.2"]
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = local.s3_origin_id
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
       }
     }
 
+    viewer_protocol_policy = "allow-all"
+    min_ttl                = 0
+    default_ttl            = 0
+    max_ttl                = 0
   }
 
+  ordered_cache_behavior {
+    path_pattern     = "/index_files/*"
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = local.s3_origin_id
 
-  default_cache_behavior = {
-    path_pattern     = "/*"
-    target_origin_id = "s3_one"
-    #viewer_protocol_policy = "redirect-to-https"
+    forwarded_values {
+      query_string = false
+      headers      = ["Origin"]
 
-    allowed_methods = ["GET", "HEAD", "OPTIONS"]
-    cached_methods  = ["GET", "HEAD"]
-    compress        = false
-    query_string    = true
+      cookies {
+        forward = "none"
+      }
+    }
 
     viewer_protocol_policy = "allow-all"
     min_ttl                = 0
@@ -378,13 +402,15 @@ module "cloudfront" {
     max_ttl                = 86400
   }
 
-  viewer_certificate = {
+  price_class = "PriceClass_All"
+
+  viewer_certificate {
     cloudfront_default_certificate = true
   }
 
-  tags = {
-    ManagedBy = "Terraform"
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
   }
-
 }
-
